@@ -17,9 +17,9 @@ from logics.research_summary_handler import (
 # ----------------- Streamlit Configuration -----------------
 st.set_page_config(
     layout="centered",
-    page_title="🧠 Structured Research Repository",
+    page_title="🧠 AI-Research Assistant",
 )
-st.title("🧠 Structured Research Repository & Paper Summarizer")
+st.title("🧠 AI-Research Assistant")
 
 # ----------------- Authentication -----------------
 if not check_password():
