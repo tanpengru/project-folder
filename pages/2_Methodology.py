@@ -15,9 +15,6 @@ st.markdown("""
 
 This page explains the **end-to-end workflow** for each use case inside the 
 **Structured Research Repository & Paper Summarizer** application. It covers:
-
-1. **Upload & Summarize PDF Papers**  
-2. **Search Open-Access Research Papers**
 """)
 
 # ----------------- Expander 1 -----------------
