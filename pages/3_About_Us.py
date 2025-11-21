@@ -8,7 +8,7 @@ st.set_page_config(
 # endregion <--------- Streamlit App Configuration --------->
 
 # ------------------ PAGE TITLE ------------------
-st.title("📘 About This Research Intelligence App")
+st.title("📘 About This AI-Research Assistant")
 
 st.write(
     """
@@ -107,7 +107,3 @@ with st.expander("Expand — AI Insights"):
 - Receive structured, academically suitable responses.
 """
     )
-
-# ------------------ FOOTER ------------------
-st.write("---")
-st.caption("🚀 Built with Streamlit + OpenAI + OpenAlex for modern research acceleration.")
