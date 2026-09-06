@@ -3,12 +3,16 @@
 #
 # Functions:
 # 1. Store and manage past NRF Parliamentary Questions & Answers
-# 2. Upload and manage NRF-related PDF, DOCX and Excel documents
-# 3. Semantic search across PQs and NRF documents
+# 2. Upload and manage NRF-related PDF, DOCX, Excel and TXT documents
+# 3. AI chatbot grounded in:
+#    - Parliamentary Questions / NRF answers
+#    - Uploaded NRF documents
 #
 # Search engine:
 # helper_functions/PQAI.py
-# SentenceTransformer + cosine similarity
+#
+# AI:
+# OpenAI Responses API
 # ============================================================
 
 import os
@@ -30,6 +34,8 @@ from lxml import etree
 from pdf2image import convert_from_path
 import pytesseract
 
+from openai import OpenAI
+
 
 # ============================================================
 # 🔐 AUTH
@@ -45,8 +51,6 @@ from helper_functions.utility import check_password
 try:
     from helper_functions import PQAI
 except ImportError:
-    # More reliable when helper_functions is a namespace package
-    # or does not expose PQAI in __init__.py.
     PQAI = importlib.import_module("helper_functions.PQAI")
 
 
@@ -123,35 +127,23 @@ def load_csv(path, columns):
     """Load CSV while ensuring all expected columns exist."""
 
     if os.path.exists(path):
-
         try:
-
             df = pd.read_csv(
                 path,
                 dtype=str,
                 keep_default_na=False
             )
-
         except Exception as exc:
-
             logger.exception(
                 "Failed to load CSV %s: %s",
                 path,
                 exc
             )
-
-            df = pd.DataFrame(
-                columns=columns
-            )
-
+            df = pd.DataFrame(columns=columns)
     else:
-
-        df = pd.DataFrame(
-            columns=columns
-        )
+        df = pd.DataFrame(columns=columns)
 
     for col in columns:
-
         if col not in df.columns:
             df[col] = ""
 
@@ -172,7 +164,6 @@ def generate_id(prefix):
     """Generate short unique ID."""
 
     timestamp = datetime.now().isoformat()
-
     raw = f"{prefix}_{timestamp}"
 
     return hashlib.md5(
@@ -193,12 +184,10 @@ def ensure_unique_path(folder, filename):
     counter = 1
 
     while os.path.exists(path):
-
         path = os.path.join(
             folder,
             f"{base} ({counter}){ext}"
         )
-
         counter += 1
 
     return path
@@ -226,7 +215,6 @@ def extract_textboxes_from_docx(filepath):
     }
 
     try:
-
         with zipfile.ZipFile(
             filepath,
             "r"
@@ -241,48 +229,36 @@ def extract_textboxes_from_docx(filepath):
                     continue
 
                 try:
-
                     xml_data = docx.read(name)
-
-                    root = etree.fromstring(
-                        xml_data
-                    )
-
+                    root = etree.fromstring(xml_data)
                 except Exception:
                     continue
 
-                # Standard Word textboxes
                 for node in root.findall(
                     ".//w:txbxContent",
                     ns
                 ):
-
                     text_chunks.extend(
                         node.itertext()
                     )
 
-                # Word 2010 shapes
                 for node in root.findall(
                     ".//wps:txbx",
                     ns
                 ):
-
                     text_chunks.extend(
                         node.itertext()
                     )
 
-                # Legacy VML
                 for node in root.findall(
                     ".//v:textbox",
                     ns
                 ):
-
                     text_chunks.extend(
                         node.itertext()
                     )
 
     except Exception as exc:
-
         logger.exception(
             "Failed to extract DOCX textboxes from %s: %s",
             filepath,
@@ -304,35 +280,22 @@ def extract_text_from_pdf(filepath):
 
     parts = []
 
-    # --------------------------------------------------------
-    # 1. pdfplumber
-    # --------------------------------------------------------
-
     try:
-
         with pdfplumber.open(filepath) as pdf:
-
             for page in pdf.pages:
-
                 text = page.extract_text()
 
                 if text and text.strip():
                     parts.append(text)
 
     except Exception as exc:
-
         logger.warning(
             "pdfplumber failed for %s: %s",
             filepath,
             exc
         )
 
-    # --------------------------------------------------------
-    # 2. PyPDF2 fallback
-    # --------------------------------------------------------
-
     try:
-
         reader = PdfReader(filepath)
 
         text = "\n".join(
@@ -344,19 +307,13 @@ def extract_text_from_pdf(filepath):
             parts.append(text)
 
     except Exception as exc:
-
         logger.warning(
             "PyPDF2 failed for %s: %s",
             filepath,
             exc
         )
 
-    # --------------------------------------------------------
-    # 3. OCR fallback
-    # --------------------------------------------------------
-
     try:
-
         if not parts:
 
             images = convert_from_path(
@@ -367,7 +324,6 @@ def extract_text_from_pdf(filepath):
             ocr_parts = []
 
             for image in images:
-
                 text = pytesseract.image_to_string(
                     image
                 )
@@ -376,13 +332,11 @@ def extract_text_from_pdf(filepath):
                     ocr_parts.append(text)
 
             if ocr_parts:
-
                 parts.append(
                     "\n".join(ocr_parts)
                 )
 
     except Exception as exc:
-
         logger.warning(
             "OCR fallback failed for %s: %s",
             filepath,
@@ -401,60 +355,46 @@ def extract_text_from_docx(filepath):
     parts = []
 
     try:
-
         doc = Document(filepath)
 
-        # Paragraphs
         for paragraph in doc.paragraphs:
-
             text = paragraph.text.strip()
 
             if text:
                 parts.append(text)
 
-        # Tables
         for table in doc.tables:
-
             for row in table.rows:
 
                 cells = []
 
                 for cell in row.cells:
-
                     text = cell.text.strip()
 
                     if text:
                         cells.append(text)
 
                 if cells:
-
                     parts.append(
                         " | ".join(cells)
                     )
 
     except Exception as exc:
-
         logger.warning(
             "DOCX extraction failed for %s: %s",
             filepath,
             exc
         )
 
-    # Textboxes
     try:
-
         textbox_text = extract_textboxes_from_docx(
             filepath
         )
 
         if textbox_text.strip():
-
-            parts.append(
-                textbox_text
-            )
+            parts.append(textbox_text)
 
     except Exception as exc:
-
         logger.warning(
             "DOCX textbox extraction failed for %s: %s",
             filepath,
@@ -473,15 +413,11 @@ def extract_text_from_excel(filepath):
     parts = []
 
     try:
-
-        excel_file = pd.ExcelFile(
-            filepath
-        )
+        excel_file = pd.ExcelFile(filepath)
 
         for sheet_name in excel_file.sheet_names:
 
             try:
-
                 df = pd.read_excel(
                     filepath,
                     sheet_name=sheet_name,
@@ -510,13 +446,11 @@ def extract_text_from_excel(filepath):
                     ]
 
                     if values:
-
                         parts.append(
                             " | ".join(values)
                         )
 
             except Exception as exc:
-
                 logger.warning(
                     "Failed to read Excel sheet %s in %s: %s",
                     sheet_name,
@@ -524,10 +458,7 @@ def extract_text_from_excel(filepath):
                     exc
                 )
 
-                continue
-
     except Exception as exc:
-
         logger.warning(
             "Excel extraction failed for %s: %s",
             filepath,
@@ -554,41 +485,29 @@ def extract_raw_text(filepath):
     )[1].lower()
 
     if extension == ".pdf":
-
-        return extract_text_from_pdf(
-            filepath
-        )
+        return extract_text_from_pdf(filepath)
 
     elif extension == ".docx":
-
-        return extract_text_from_docx(
-            filepath
-        )
+        return extract_text_from_docx(filepath)
 
     elif extension in [
         ".xlsx",
         ".xls"
     ]:
-
-        return extract_text_from_excel(
-            filepath
-        )
+        return extract_text_from_excel(filepath)
 
     elif extension == ".txt":
 
         try:
-
             with open(
                 filepath,
                 "r",
                 encoding="utf-8",
                 errors="ignore"
             ) as f:
-
                 return f.read()
 
         except Exception as exc:
-
             logger.warning(
                 "TXT extraction failed for %s: %s",
                 filepath,
@@ -609,8 +528,7 @@ def rebuild_search_index_safe(
     document_dataframe
 ):
     """
-    Rebuild the semantic search index without allowing a
-    search-engine failure to crash the whole Streamlit page.
+    Rebuild semantic search index safely.
 
     Returns:
         (success, rebuilt_index)
@@ -623,25 +541,19 @@ def rebuild_search_index_safe(
             document_dataframe
         )
 
-        # Optimized PQAI returns the rebuilt DataFrame.
         if isinstance(rebuilt, pd.DataFrame):
-
             return True, rebuilt
 
-        # Backward compatibility with an older PQAI version
-        # that returned (index_df, embeddings).
         if (
             isinstance(rebuilt, tuple)
             and len(rebuilt) >= 1
             and isinstance(rebuilt[0], pd.DataFrame)
         ):
-
             return True, rebuilt[0]
 
-        # Unexpected return value.
         logger.warning(
-            "PQAI.rebuild_search_index returned unexpected "
-            "type: %s",
+            "PQAI.rebuild_search_index returned "
+            "unexpected type: %s",
             type(rebuilt).__name__
         )
 
@@ -655,6 +567,455 @@ def rebuild_search_index_safe(
         )
 
         return False, pd.DataFrame()
+
+
+# ============================================================
+# 🤖 OPENAI CLIENT
+# ============================================================
+
+def get_openai_api_key():
+    """
+    Load OpenAI API key from Streamlit Secrets first,
+    then environment variables.
+    """
+
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+
+    return os.getenv(
+        "OPENAI_API_KEY",
+        ""
+    )
+
+
+def get_openai_model():
+    """
+    Allow the model to be configured in Streamlit Secrets.
+    """
+
+    try:
+        if "OPENAI_MODEL" in st.secrets:
+            return st.secrets["OPENAI_MODEL"]
+    except Exception:
+        pass
+
+    return os.getenv(
+        "OPENAI_MODEL",
+        "gpt-5-mini"
+    )
+
+
+def get_openai_client():
+
+    api_key = get_openai_api_key()
+
+    if not api_key:
+        return None
+
+    return OpenAI(
+        api_key=api_key
+    )
+
+
+# ============================================================
+# 🤖 CHATBOT SEARCH HELPERS
+# ============================================================
+
+def retrieve_chatbot_sources(
+    query,
+    pq_top_k=5,
+    document_top_k=5,
+    min_similarity=0.20
+):
+    """
+    Search PQs and NRF documents separately.
+
+    This deliberately avoids one source category crowding
+    out the other when searching the combined repository.
+    """
+
+    try:
+        pq_results = (
+            PQAI.search_parliamentary_questions(
+                query=query,
+                top_k=pq_top_k,
+                min_similarity=min_similarity
+            )
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "PQ retrieval failed: %s",
+            exc
+        )
+
+        pq_results = pd.DataFrame()
+
+    try:
+        document_results = (
+            PQAI.search_nrf_documents(
+                query=query,
+                top_k=document_top_k,
+                min_similarity=min_similarity
+            )
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Document retrieval failed: %s",
+            exc
+        )
+
+        document_results = pd.DataFrame()
+
+    sources = []
+
+    # --------------------------------------------------------
+    # PQ sources
+    # --------------------------------------------------------
+
+    if not pq_results.empty:
+
+        for i, (_, row) in enumerate(
+            pq_results.iterrows(),
+            start=1
+        ):
+
+            sources.append(
+                {
+                    "label":
+                        f"PQ{i}",
+
+                    "source_type":
+                        "Parliamentary Question",
+
+                    "title":
+                        str(
+                            row.get(
+                                "title",
+                                "Parliamentary Question"
+                            )
+                        ),
+
+                    "text":
+                        str(
+                            row.get(
+                                "text",
+                                ""
+                            )
+                        ),
+
+                    "similarity":
+                        float(
+                            row.get(
+                                "similarity",
+                                0
+                            )
+                        ),
+
+                    "metadata":
+                        row.get(
+                            "metadata",
+                            ""
+                        ),
+                }
+            )
+
+    # --------------------------------------------------------
+    # Document sources
+    # --------------------------------------------------------
+
+    if not document_results.empty:
+
+        for i, (_, row) in enumerate(
+            document_results.iterrows(),
+            start=1
+        ):
+
+            sources.append(
+                {
+                    "label":
+                        f"DOC{i}",
+
+                    "source_type":
+                        "NRF Document",
+
+                    "title":
+                        str(
+                            row.get(
+                                "title",
+                                "NRF Document"
+                            )
+                        ),
+
+                    "text":
+                        str(
+                            row.get(
+                                "text",
+                                ""
+                            )
+                        ),
+
+                    "similarity":
+                        float(
+                            row.get(
+                                "similarity",
+                                0
+                            )
+                        ),
+
+                    "metadata":
+                        row.get(
+                            "metadata",
+                            ""
+                        ),
+                }
+            )
+
+    return sources
+
+
+# ============================================================
+# 🤖 SOURCE CONTEXT BUILDER
+# ============================================================
+
+def build_chatbot_context(
+    sources
+):
+    """
+    Build a source-labelled evidence block for the AI.
+    """
+
+    context_parts = []
+
+    for source in sources:
+
+        label = source.get(
+            "label",
+            ""
+        )
+
+        source_type = source.get(
+            "source_type",
+            ""
+        )
+
+        title = source.get(
+            "title",
+            ""
+        )
+
+        text = source.get(
+            "text",
+            ""
+        )
+
+        metadata = source.get(
+            "metadata",
+            ""
+        )
+
+        similarity = source.get(
+            "similarity",
+            0
+        )
+
+        if isinstance(
+            metadata,
+            str
+        ):
+
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+
+        if not isinstance(
+            metadata,
+            dict
+        ):
+            metadata = {}
+
+        context_parts.append(
+            f"""
+SOURCE [{label}]
+Source type: {source_type}
+Title: {title}
+Retrieval relevance: {similarity:.1%}
+Metadata: {json.dumps(metadata, ensure_ascii=False)}
+
+Relevant passage:
+{text}
+""".strip()
+        )
+
+    return "\n\n---\n\n".join(
+        context_parts
+    )
+
+
+# ============================================================
+# 🤖 CHAT HISTORY BUILDER
+# ============================================================
+
+def build_recent_chat_history(
+    messages,
+    max_messages=8
+):
+    """
+    Provide a limited amount of conversational history
+    to the model while preventing the prompt from growing
+    indefinitely.
+    """
+
+    if not messages:
+        return ""
+
+    recent_messages = messages[
+        -max_messages:
+    ]
+
+    parts = []
+
+    for message in recent_messages:
+
+        role = message.get(
+            "role",
+            ""
+        )
+
+        content = message.get(
+            "content",
+            ""
+        )
+
+        if role == "user":
+            speaker = "User"
+
+        elif role == "assistant":
+            speaker = "NRF AI Assistant"
+
+        else:
+            continue
+
+        parts.append(
+            f"{speaker}:\n{content}"
+        )
+
+    return "\n\n".join(parts)
+
+
+# ============================================================
+# 🤖 GENERATE GROUNDED AI RESPONSE
+# ============================================================
+
+def generate_chatbot_answer(
+    query,
+    sources,
+    chat_history
+):
+    """
+    Generate an answer grounded only in retrieved NRF sources.
+    """
+
+    client = get_openai_client()
+
+    if client is None:
+        raise RuntimeError(
+            "OPENAI_API_KEY has not been configured."
+        )
+
+    if not sources:
+        return (
+            "I could not find sufficiently relevant information "
+            "in the Parliamentary Questions or uploaded NRF "
+            "documents to answer this question reliably."
+        )
+
+    context = build_chatbot_context(
+        sources
+    )
+
+    recent_history = build_recent_chat_history(
+        chat_history
+    )
+
+    instructions = """
+You are the NRF Knowledge AI Assistant.
+
+Your task is to answer questions using ONLY the evidence supplied
+from the NRF knowledge repository.
+
+The repository contains:
+1. Historical Parliamentary Questions and NRF answers.
+2. NRF-related uploaded documents.
+
+IMPORTANT RULES:
+
+- Ground all factual claims in the supplied sources.
+- Do not invent NRF positions, policies, programmes, statistics,
+  dates, commitments or explanations.
+- If the evidence is insufficient, say that the repository does
+  not contain enough information to answer confidently.
+- Where useful, distinguish between what NRF said in a
+  Parliamentary Question and what appears in an NRF document.
+- Cite supporting evidence inline using the exact source labels,
+  for example [PQ1], [PQ2], [DOC1].
+- Never invent source labels.
+- Multiple sources may be cited together, for example
+  [PQ1][DOC2].
+- Prefer synthesis over copying source text.
+- Answer directly and clearly.
+- Use concise headings or bullets only when they improve clarity.
+- Do not mention semantic similarity scores.
+- Do not claim to have searched sources that were not supplied.
+"""
+
+    prompt = f"""
+CURRENT USER QUESTION
+
+{query}
+
+
+RECENT CONVERSATION
+
+{recent_history or "No previous conversation."}
+
+
+RETRIEVED NRF EVIDENCE
+
+{context}
+
+
+Answer the current user question using the retrieved NRF evidence.
+Use inline citations such as [PQ1] and [DOC1].
+"""
+
+    model = get_openai_model()
+
+    response = client.responses.create(
+        model=model,
+        instructions=instructions,
+        input=prompt
+    )
+
+    answer = getattr(
+        response,
+        "output_text",
+        ""
+    )
+
+    if not answer:
+        raise RuntimeError(
+            "The AI model returned an empty response."
+        )
+
+    return answer.strip()
 
 
 # ============================================================
@@ -676,9 +1037,9 @@ document_df = load_csv(
 # 🧭 MAIN NAVIGATION
 # ============================================================
 
-tab_search, tab_pq, tab_documents, tab_admin = st.tabs(
+tab_chat, tab_pq, tab_documents, tab_admin = st.tabs(
     [
-        "🔎 Semantic Search",
+        "🤖 NRF AI Chatbot",
         "🏛️ Parliamentary Questions",
         "📚 NRF Documents",
         "⚙️ Repository Management",
@@ -687,216 +1048,434 @@ tab_search, tab_pq, tab_documents, tab_admin = st.tabs(
 
 
 # ============================================================
-# 🔎 TAB 1 — SEMANTIC SEARCH
+# 🤖 TAB 1 — NRF AI CHATBOT
 # ============================================================
 
-with tab_search:
+with tab_chat:
 
     st.header(
-        "🔎 Search NRF Knowledge Repository"
+        "🤖 NRF Knowledge AI Chatbot"
     )
 
-    st.write(
+    st.markdown(
         """
-        Search past Parliamentary Questions, NRF answers,
-        and uploaded NRF documents using natural language.
+        Ask questions about NRF using the knowledge stored in
+        this repository.
+
+        The chatbot searches both:
+
+        - **Historical Parliamentary Questions and NRF answers**
+        - **Uploaded NRF documents**
+
+        before generating its response.
         """
     )
 
-    query = st.text_area(
-        "What would you like to find?",
-        placeholder=(
-            "e.g. What has NRF said about supporting "
-            "AI research and innovation?"
-        ),
-        height=100
-    )
+    # --------------------------------------------------------
+    # API status
+    # --------------------------------------------------------
 
-    col1, col2, col3 = st.columns(
-        [2, 1, 1]
-    )
+    api_key = get_openai_api_key()
 
-    with col1:
+    if not api_key:
 
-        source_filter = st.selectbox(
-            "Search in",
-            [
-                "All Sources",
-                "Parliamentary Question",
-                "NRF Document"
-            ]
+        st.warning(
+            """
+            OpenAI API access has not been configured.
+
+            Add `OPENAI_API_KEY` to Streamlit Secrets to enable
+            AI-generated answers.
+            """
         )
 
-    with col2:
+    # --------------------------------------------------------
+    # Search-index health
+    # --------------------------------------------------------
 
-        top_k = st.number_input(
-            "Number of results",
-            min_value=1,
-            max_value=50,
-            value=10
+    try:
+
+        search_index = (
+            PQAI.load_search_index()
         )
 
-    with col3:
+    except Exception:
 
-        min_score = st.slider(
-            "Minimum similarity",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.25,
-            step=0.05
+        search_index = pd.DataFrame()
+
+    if search_index.empty:
+
+        st.info(
+            """
+            The semantic search index is currently empty.
+
+            Add Parliamentary Questions or NRF documents, then
+            go to **Repository Management → Rebuild Semantic
+            Search Index**.
+            """
         )
 
-    search_button = st.button(
-        "🔎 Search",
-        type="primary"
+    # --------------------------------------------------------
+    # Chat state
+    # --------------------------------------------------------
+
+    if "nrf_chat_messages" not in st.session_state:
+
+        st.session_state[
+            "nrf_chat_messages"
+        ] = []
+
+    if "nrf_chat_sources" not in st.session_state:
+
+        st.session_state[
+            "nrf_chat_sources"
+        ] = {}
+
+    # --------------------------------------------------------
+    # Chat controls
+    # --------------------------------------------------------
+
+    control_col1, control_col2 = st.columns(
+        [5, 1]
     )
 
-    if search_button:
+    with control_col2:
 
-        if not query.strip():
+        if st.button(
+            "🗑️ Clear chat",
+            use_container_width=True
+        ):
 
-            st.warning(
-                "Please enter a search question."
+            st.session_state[
+                "nrf_chat_messages"
+            ] = []
+
+            st.session_state[
+                "nrf_chat_sources"
+            ] = {}
+
+            st.rerun()
+
+    # --------------------------------------------------------
+    # Welcome message
+    # --------------------------------------------------------
+
+    if not st.session_state[
+        "nrf_chat_messages"
+    ]:
+
+        with st.chat_message(
+            "assistant"
+        ):
+
+            st.markdown(
+                """
+                Hello. I can answer questions using the NRF
+                repository.
+
+                For example:
+
+                - What has NRF said about AI research?
+                - What Parliamentary Questions have been asked
+                  about R&D funding?
+                - What do our uploaded documents say about
+                  research manpower?
+                - Compare NRF's Parliamentary responses with
+                  the relevant strategy documents.
+                """
             )
 
-        else:
+    # --------------------------------------------------------
+    # Existing chat
+    # --------------------------------------------------------
+
+    for message_index, message in enumerate(
+        st.session_state[
+            "nrf_chat_messages"
+        ]
+    ):
+
+        role = message.get(
+            "role",
+            "assistant"
+        )
+
+        content = message.get(
+            "content",
+            ""
+        )
+
+        with st.chat_message(role):
+
+            st.markdown(content)
+
+            if role == "assistant":
+
+                sources = (
+                    st.session_state[
+                        "nrf_chat_sources"
+                    ]
+                    .get(
+                        str(message_index),
+                        []
+                    )
+                )
+
+                if sources:
+
+                    with st.expander(
+                        f"📚 Sources used ({len(sources)})"
+                    ):
+
+                        for source in sources:
+
+                            label = source.get(
+                                "label",
+                                ""
+                            )
+
+                            source_type = (
+                                source.get(
+                                    "source_type",
+                                    ""
+                                )
+                            )
+
+                            title = source.get(
+                                "title",
+                                ""
+                            )
+
+                            text = source.get(
+                                "text",
+                                ""
+                            )
+
+                            similarity = source.get(
+                                "similarity",
+                                0
+                            )
+
+                            if (
+                                source_type
+                                == "Parliamentary Question"
+                            ):
+                                icon = "🏛️"
+
+                            else:
+                                icon = "📄"
+
+                            st.markdown(
+                                f"### {icon} [{label}] {title}"
+                            )
+
+                            st.caption(
+                                f"Retrieval relevance: "
+                                f"{similarity:.1%}"
+                            )
+
+                            st.write(text)
+
+                            st.markdown("---")
+
+    # --------------------------------------------------------
+    # User input
+    # --------------------------------------------------------
+
+    user_question = st.chat_input(
+        "Ask a question about NRF..."
+    )
+
+    if user_question:
+
+        # ----------------------------------------------------
+        # Save user message
+        # ----------------------------------------------------
+
+        st.session_state[
+            "nrf_chat_messages"
+        ].append(
+            {
+                "role":
+                    "user",
+
+                "content":
+                    user_question
+            }
+        )
+
+        with st.chat_message(
+            "user"
+        ):
+
+            st.markdown(
+                user_question
+            )
+
+        # ----------------------------------------------------
+        # Retrieve evidence
+        # ----------------------------------------------------
+
+        with st.chat_message(
+            "assistant"
+        ):
 
             with st.spinner(
-                "Searching NRF knowledge repository..."
+                "Searching Parliamentary Questions and "
+                "NRF documents..."
             ):
 
-                try:
-
-                    results = PQAI.semantic_search(
-                        query=query,
-                        top_k=int(top_k),
-                        source_filter=source_filter,
-                        min_similarity=float(min_score)
+                sources = (
+                    retrieve_chatbot_sources(
+                        query=user_question,
+                        pq_top_k=5,
+                        document_top_k=5,
+                        min_similarity=0.20
                     )
+                )
 
-                except Exception as exc:
+            # ------------------------------------------------
+            # Generate response
+            # ------------------------------------------------
 
-                    logger.exception(
-                        "Semantic search failed: %s",
-                        exc
-                    )
+            if not sources:
 
-                    st.error(
-                        f"Search failed: {exc}"
-                    )
+                answer = (
+                    "I could not find sufficiently relevant "
+                    "information in the Parliamentary Questions "
+                    "or uploaded NRF documents to answer this "
+                    "question reliably."
+                )
 
-                    results = pd.DataFrame()
+            elif not api_key:
 
-            if results.empty:
-
-                st.info(
-                    "No indexed information found "
-                    "above the selected similarity threshold."
+                answer = (
+                    "I found relevant repository sources, but "
+                    "the OpenAI API key has not been configured, "
+                    "so I cannot generate the AI response yet."
                 )
 
             else:
 
-                st.markdown(
-                    f"### {len(results)} relevant results"
-                )
+                try:
 
-                for _, row in results.iterrows():
-
-                    try:
-                        score = float(
-                            row.get(
-                                "similarity",
-                                0
-                            )
-                        )
-                    except (TypeError, ValueError):
-                        score = 0.0
-
-                    if (
-                        row.get("source_type", "")
-                        == "Parliamentary Question"
+                    with st.spinner(
+                        "Preparing NRF-grounded answer..."
                     ):
 
-                        icon = "🏛️"
-
-                    else:
-
-                        icon = "📄"
-
-                    title = str(
-                        row.get(
-                            "title",
-                            "Untitled"
+                        answer = (
+                            generate_chatbot_answer(
+                                query=user_question,
+                                sources=sources,
+                                chat_history=(
+                                    st.session_state[
+                                        "nrf_chat_messages"
+                                    ]
+                                )
+                            )
                         )
+
+                except Exception as exc:
+
+                    logger.exception(
+                        "AI chatbot generation failed: %s",
+                        exc
                     )
 
-                    with st.expander(
-                        f"{icon} "
-                        f"{title} "
-                        f" — {score:.0%} relevance"
-                    ):
+                    answer = (
+                        "I found relevant NRF repository "
+                        "information, but the AI response "
+                        "could not be generated.\n\n"
+                        f"Error: `{exc}`"
+                    )
 
-                        st.markdown(
-                            f"**Source type:** "
-                            f"{row.get('source_type', '')}"
-                        )
+            st.markdown(answer)
 
-                        st.markdown(
-                            f"**Relevance:** "
-                            f"{score:.1%}"
-                        )
+            # ------------------------------------------------
+            # Display sources immediately
+            # ------------------------------------------------
 
-                        st.markdown(
-                            "### Relevant Passage"
-                        )
+            if sources:
 
-                        st.write(
-                            row.get(
-                                "text",
-                                ""
-                            )
-                        )
+                with st.expander(
+                    f"📚 Sources used ({len(sources)})"
+                ):
 
-                        metadata = row.get(
-                            "metadata",
+                    for source in sources:
+
+                        label = source.get(
+                            "label",
                             ""
                         )
 
-                        if metadata:
+                        source_type = source.get(
+                            "source_type",
+                            ""
+                        )
 
-                            try:
+                        title = source.get(
+                            "title",
+                            ""
+                        )
 
-                                if isinstance(
-                                    metadata,
-                                    str
-                                ):
+                        text = source.get(
+                            "text",
+                            ""
+                        )
 
-                                    metadata = json.loads(
-                                        metadata
-                                    )
+                        similarity = source.get(
+                            "similarity",
+                            0
+                        )
 
-                                if metadata:
+                        if (
+                            source_type
+                            == "Parliamentary Question"
+                        ):
+                            icon = "🏛️"
 
-                                    st.markdown(
-                                        "### Source Information"
-                                    )
+                        else:
+                            icon = "📄"
 
-                                    for key, value in metadata.items():
+                        st.markdown(
+                            f"### {icon} [{label}] {title}"
+                        )
 
-                                        if value:
+                        st.caption(
+                            f"Retrieval relevance: "
+                            f"{similarity:.1%}"
+                        )
 
-                                            st.caption(
-                                                f"{key.replace('_', ' ').title()}: "
-                                                f"{value}"
-                                            )
+                        st.write(text)
 
-                            except Exception as exc:
+                        st.markdown("---")
 
-                                logger.debug(
-                                    "Could not parse search-result "
-                                    "metadata: %s",
-                                    exc
-                                )
+        # ----------------------------------------------------
+        # Save assistant message and source mapping
+        # ----------------------------------------------------
+
+        assistant_index = len(
+            st.session_state[
+                "nrf_chat_messages"
+            ]
+        )
+
+        st.session_state[
+            "nrf_chat_messages"
+        ].append(
+            {
+                "role":
+                    "assistant",
+
+                "content":
+                    answer
+            }
+        )
+
+        st.session_state[
+            "nrf_chat_sources"
+        ][
+            str(assistant_index)
+        ] = sources
 
 
 # ============================================================
@@ -1222,10 +1801,6 @@ with tab_pq:
             f"Parliamentary Questions found**"
         )
 
-        # ====================================================
-        # DISPLAY PQS
-        # ====================================================
-
         for _, row in filtered_pq.iterrows():
 
             title = (
@@ -1366,10 +1941,6 @@ with tab_documents:
                 f"### `{uploaded_file.name}`"
             )
 
-            # ------------------------------------------------
-            # Metadata
-            # ------------------------------------------------
-
             col1, col2 = st.columns(2)
 
             with col1:
@@ -1421,10 +1992,6 @@ with tab_documents:
                 type="primary"
             ):
 
-                # ------------------------------------------------
-                # Duplicate check
-                # ------------------------------------------------
-
                 existing = document_df[
                     document_df["filename"]
                     .astype(str)
@@ -1440,10 +2007,6 @@ with tab_documents:
                     )
 
                     continue
-
-                # ------------------------------------------------
-                # Save only after Add button is pressed
-                # ------------------------------------------------
 
                 save_path = ensure_unique_path(
                     DOCUMENT_FOLDER,
@@ -1476,10 +2039,6 @@ with tab_documents:
 
                     continue
 
-                # ------------------------------------------------
-                # Extract text
-                # ------------------------------------------------
-
                 with st.spinner(
                     "Extracting document contents..."
                 ):
@@ -1495,17 +2054,12 @@ with tab_documents:
                         "this document."
                     )
 
-                    # Do not leave an orphan file behind.
                     try:
                         os.remove(save_path)
                     except OSError:
                         pass
 
                     continue
-
-                # ------------------------------------------------
-                # Add metadata
-                # ------------------------------------------------
 
                 document_id = generate_id(
                     "DOC"
@@ -1556,10 +2110,6 @@ with tab_documents:
                     DOCUMENT_METADATA_FILE
                 )
 
-                # ------------------------------------------------
-                # Rebuild semantic index
-                # ------------------------------------------------
-
                 with st.spinner(
                     "Adding document to semantic search index..."
                 ):
@@ -1587,18 +2137,12 @@ with tab_documents:
                         f"index rebuild failed."
                     )
 
-    # ========================================================
-    # DOCUMENT REPOSITORY
-    # ========================================================
-
     st.markdown("---")
 
     st.subheader(
         "📂 Uploaded NRF Documents"
     )
 
-    # Reload metadata because documents may have been added
-    # during the current Streamlit run.
     document_df = load_csv(
         DOCUMENT_METADATA_FILE,
         DOCUMENT_COLUMNS
@@ -1728,20 +2272,13 @@ with tab_documents:
                             "filepath"
                         ]
 
-                        # ------------------------------------
-                        # Delete physical file
-                        # ------------------------------------
-
                         if (
                             isinstance(filepath, str)
                             and os.path.exists(filepath)
                         ):
 
                             try:
-
-                                os.remove(
-                                    filepath
-                                )
+                                os.remove(filepath)
 
                             except Exception as exc:
 
@@ -1751,10 +2288,6 @@ with tab_documents:
                                     filepath,
                                     exc
                                 )
-
-                        # ------------------------------------
-                        # Delete metadata
-                        # ------------------------------------
 
                         document_df = document_df[
                             document_df[
@@ -1767,10 +2300,6 @@ with tab_documents:
                             document_df,
                             DOCUMENT_METADATA_FILE
                         )
-
-                        # ------------------------------------
-                        # Rebuild semantic index
-                        # ------------------------------------
 
                         with st.spinner(
                             "Updating search index..."
@@ -1809,7 +2338,6 @@ with tab_admin:
         "⚙️ Repository Management"
     )
 
-    # Always load current repository state.
     pq_df = load_csv(
         PQ_METADATA_FILE,
         PQ_COLUMNS
@@ -1820,12 +2348,7 @@ with tab_admin:
         DOCUMENT_COLUMNS
     )
 
-    # --------------------------------------------------------
-    # Search statistics
-    # --------------------------------------------------------
-
     try:
-
         search_index = PQAI.load_search_index()
 
     except Exception as exc:
@@ -1861,10 +2384,6 @@ with tab_admin:
         )
 
     st.markdown("---")
-
-    # ========================================================
-    # SEARCH INDEX
-    # ========================================================
 
     st.subheader(
         "🔄 Search Index"
@@ -1910,10 +2429,6 @@ with tab_admin:
 
     st.markdown("---")
 
-    # ========================================================
-    # SEARCH INDEX HEALTH
-    # ========================================================
-
     st.subheader(
         "🩺 Search Index Health"
     )
@@ -1921,7 +2436,6 @@ with tab_admin:
     embeddings = None
 
     try:
-
         embeddings = PQAI.load_embeddings()
 
     except Exception as exc:
@@ -1934,11 +2448,9 @@ with tab_admin:
     index_count = len(search_index)
 
     if embeddings is None:
-
         embedding_count = 0
 
     else:
-
         try:
             embedding_count = len(embeddings)
         except TypeError:
@@ -1986,10 +2498,6 @@ with tab_admin:
         )
 
     st.markdown("---")
-
-    # ========================================================
-    # REPOSITORY DATA
-    # ========================================================
 
     st.subheader(
         "📊 Repository Data"
