@@ -604,7 +604,7 @@ def get_openai_model():
 
     return os.getenv(
         "OPENAI_MODEL",
-        "gpt-5-mini"
+        "gpt-4o-mini"
     )
 
 
