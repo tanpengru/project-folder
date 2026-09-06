@@ -8,6 +8,11 @@
 #    - Parliamentary Questions / NRF answers
 #    - Uploaded NRF documents
 #
+# Citation rules:
+# - One unique Parliamentary Question = one [PQ#]
+# - One unique uploaded NRF document = one [DOC#]
+# - Multiple chunks from the same source use the SAME citation
+#
 # Search engine:
 # helper_functions/PQAI.py
 #
@@ -104,7 +109,6 @@ PQ_COLUMNS = [
     "source",
     "uploaded_at",
 ]
-
 
 DOCUMENT_COLUMNS = [
     "document_id",
@@ -529,9 +533,6 @@ def rebuild_search_index_safe(
 ):
     """
     Rebuild semantic search index safely.
-
-    Returns:
-        (success, rebuilt_index)
     """
 
     try:
@@ -574,10 +575,6 @@ def rebuild_search_index_safe(
 # ============================================================
 
 def get_openai_api_key():
-    """
-    Load OpenAI API key from Streamlit Secrets first,
-    then environment variables.
-    """
 
     try:
         if "OPENAI_API_KEY" in st.secrets:
@@ -592,9 +589,6 @@ def get_openai_api_key():
 
 
 def get_openai_model():
-    """
-    Allow the model to be configured in Streamlit Secrets.
-    """
 
     try:
         if "OPENAI_MODEL" in st.secrets:
@@ -621,7 +615,406 @@ def get_openai_client():
 
 
 # ============================================================
-# 🤖 CHATBOT SEARCH HELPERS
+# 🤖 UNIQUE SOURCE / CITATION HELPERS
+# ============================================================
+
+def _parse_source_metadata(metadata):
+    """
+    Convert metadata into a dictionary.
+    """
+
+    if isinstance(metadata, dict):
+        return metadata
+
+    if isinstance(metadata, str) and metadata.strip():
+
+        try:
+            parsed = json.loads(metadata)
+
+            if isinstance(parsed, dict):
+                return parsed
+
+        except Exception:
+            pass
+
+    return {}
+
+
+def _first_nonempty(*values):
+    """
+    Return first usable non-empty value.
+    """
+
+    for value in values:
+
+        if value is None:
+            continue
+
+        value = str(value).strip()
+
+        if (
+            value
+            and value.lower()
+            not in {
+                "nan",
+                "none"
+            }
+        ):
+            return value
+
+    return ""
+
+
+def _source_identity(
+    row,
+    metadata,
+    source_type
+):
+    """
+    Identify the original PQ or uploaded document.
+
+    IMPORTANT:
+    Chunk IDs must NOT be used as citation IDs.
+
+    Every chunk belonging to the same document_id will
+    therefore be grouped under one DOC citation.
+    """
+
+    if source_type == "Parliamentary Question":
+
+        return _first_nonempty(
+            row.get(
+                "pq_id",
+                ""
+            ),
+            metadata.get(
+                "pq_id",
+                ""
+            ),
+            row.get(
+                "source_id",
+                ""
+            ),
+            metadata.get(
+                "source_id",
+                ""
+            ),
+            metadata.get(
+                "id",
+                ""
+            ),
+            row.get(
+                "title",
+                ""
+            ),
+        )
+
+    return _first_nonempty(
+        row.get(
+            "document_id",
+            ""
+        ),
+        metadata.get(
+            "document_id",
+            ""
+        ),
+        row.get(
+            "source_id",
+            ""
+        ),
+        metadata.get(
+            "source_id",
+            ""
+        ),
+        row.get(
+            "filename",
+            ""
+        ),
+        metadata.get(
+            "filename",
+            ""
+        ),
+        row.get(
+            "filepath",
+            ""
+        ),
+        metadata.get(
+            "filepath",
+            ""
+        ),
+        row.get(
+            "title",
+            ""
+        ),
+    )
+
+
+def _group_search_results(
+    results,
+    source_type,
+    label_prefix,
+    max_sources
+):
+    """
+    Group semantic-search chunks by the original source.
+
+    Example:
+
+        Document A chunk 1
+        Document A chunk 4
+        Document A chunk 7
+
+    becomes:
+
+        [DOC1] Document A
+
+    All three relevant passages are still supplied to the AI,
+    but they share one citation.
+    """
+
+    if results is None or results.empty:
+        return []
+
+    grouped = {}
+    group_order = []
+
+    for row_number, (_, row) in enumerate(
+        results.iterrows(),
+        start=1
+    ):
+
+        metadata = _parse_source_metadata(
+            row.get(
+                "metadata",
+                ""
+            )
+        )
+
+        source_id = _source_identity(
+            row,
+            metadata,
+            source_type
+        )
+
+        # ----------------------------------------------------
+        # Emergency fallback
+        #
+        # Normally document_id / pq_id should always exist.
+        # ----------------------------------------------------
+
+        if not source_id:
+
+            source_id = (
+                f"__unknown_"
+                f"{source_type}_"
+                f"{row_number}"
+            )
+
+        # ----------------------------------------------------
+        # Determine human-readable title
+        # ----------------------------------------------------
+
+        if source_type == "Parliamentary Question":
+
+            title = _first_nonempty(
+                row.get(
+                    "title",
+                    ""
+                ),
+                metadata.get(
+                    "title",
+                    ""
+                ),
+                metadata.get(
+                    "question",
+                    ""
+                ),
+                "Parliamentary Question"
+            )
+
+        else:
+
+            title = _first_nonempty(
+                row.get(
+                    "title",
+                    ""
+                ),
+                metadata.get(
+                    "document_title",
+                    ""
+                ),
+                metadata.get(
+                    "title",
+                    ""
+                ),
+                metadata.get(
+                    "filename",
+                    ""
+                ),
+                row.get(
+                    "filename",
+                    ""
+                ),
+                "NRF Document"
+            )
+
+        text = _first_nonempty(
+            row.get(
+                "text",
+                ""
+            )
+        )
+
+        try:
+            similarity = float(
+                row.get(
+                    "similarity",
+                    0
+                ) or 0
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+            similarity = 0.0
+
+        # ----------------------------------------------------
+        # Create source group
+        # ----------------------------------------------------
+
+        if source_id not in grouped:
+
+            grouped[source_id] = {
+
+                "source_id":
+                    source_id,
+
+                "source_type":
+                    source_type,
+
+                "title":
+                    title,
+
+                "passages":
+                    [],
+
+                "similarity":
+                    similarity,
+
+                "metadata":
+                    metadata,
+            }
+
+            group_order.append(
+                source_id
+            )
+
+        group = grouped[
+            source_id
+        ]
+
+        # Keep highest similarity for the source.
+        group["similarity"] = max(
+            group.get(
+                "similarity",
+                0
+            ),
+            similarity
+        )
+
+        # Preserve metadata.
+        if (
+            metadata
+            and not group.get(
+                "metadata"
+            )
+        ):
+            group["metadata"] = metadata
+
+        # Avoid duplicate passages.
+        if (
+            text
+            and text
+            not in group["passages"]
+        ):
+            group[
+                "passages"
+            ].append(text)
+
+    # --------------------------------------------------------
+    # Rank UNIQUE sources by their strongest matching chunk
+    # --------------------------------------------------------
+
+    ordered_groups = sorted(
+        (
+            grouped[source_id]
+            for source_id
+            in group_order
+        ),
+        key=lambda item:
+            item.get(
+                "similarity",
+                0
+            ),
+        reverse=True
+    )
+
+    ordered_groups = ordered_groups[
+        :max_sources
+    ]
+
+    sources = []
+
+    # --------------------------------------------------------
+    # Assign citation numbers AFTER grouping
+    # --------------------------------------------------------
+
+    for citation_number, group in enumerate(
+        ordered_groups,
+        start=1
+    ):
+
+        passages = group.pop(
+            "passages",
+            []
+        )
+
+        # All retrieved chunks remain available to the model.
+        combined_text = "\n\n".join(
+            (
+                f"Relevant passage {i}:\n"
+                f"{passage}"
+            )
+            for i, passage
+            in enumerate(
+                passages,
+                start=1
+            )
+        )
+
+        group["label"] = (
+            f"{label_prefix}"
+            f"{citation_number}"
+        )
+
+        group["text"] = (
+            combined_text
+        )
+
+        group[
+            "passage_count"
+        ] = len(passages)
+
+        sources.append(
+            group
+        )
+
+    return sources
+
+
+# ============================================================
+# 🤖 CHATBOT SEARCH
 # ============================================================
 
 def retrieve_chatbot_sources(
@@ -631,17 +1024,58 @@ def retrieve_chatbot_sources(
     min_similarity=0.20
 ):
     """
-    Search PQs and NRF documents separately.
+    Search Parliamentary Questions and NRF documents.
 
-    This deliberately avoids one source category crowding
-    out the other when searching the combined repository.
+    Retrieval happens at CHUNK level.
+
+    Citation numbering happens at SOURCE level.
+
+    Therefore:
+
+        Document A chunk 1
+        Document A chunk 2
+        Document A chunk 5
+
+    all become:
+
+        [DOC1]
+
+    rather than:
+
+        [DOC1]
+        [DOC2]
+        [DOC3]
     """
 
+    # --------------------------------------------------------
+    # Search MORE chunks than final unique source count.
+    #
+    # Example:
+    # Top 5 chunks could all belong to one PDF.
+    # Searching 20 chunks gives us a better chance of finding
+    # several unique relevant documents.
+    # --------------------------------------------------------
+
+    pq_chunk_top_k = max(
+        pq_top_k * 4,
+        pq_top_k
+    )
+
+    document_chunk_top_k = max(
+        document_top_k * 4,
+        document_top_k
+    )
+
+    # --------------------------------------------------------
+    # PQ retrieval
+    # --------------------------------------------------------
+
     try:
+
         pq_results = (
             PQAI.search_parliamentary_questions(
                 query=query,
-                top_k=pq_top_k,
+                top_k=pq_chunk_top_k,
                 min_similarity=min_similarity
             )
         )
@@ -655,11 +1089,16 @@ def retrieve_chatbot_sources(
 
         pq_results = pd.DataFrame()
 
+    # --------------------------------------------------------
+    # Document retrieval
+    # --------------------------------------------------------
+
     try:
+
         document_results = (
             PQAI.search_nrf_documents(
                 query=query,
-                top_k=document_top_k,
+                top_k=document_chunk_top_k,
                 min_similarity=min_similarity
             )
         )
@@ -673,111 +1112,32 @@ def retrieve_chatbot_sources(
 
         document_results = pd.DataFrame()
 
-    sources = []
-
     # --------------------------------------------------------
-    # PQ sources
+    # GROUP PQ CHUNKS
     # --------------------------------------------------------
 
-    if not pq_results.empty:
-
-        for i, (_, row) in enumerate(
-            pq_results.iterrows(),
-            start=1
-        ):
-
-            sources.append(
-                {
-                    "label":
-                        f"PQ{i}",
-
-                    "source_type":
-                        "Parliamentary Question",
-
-                    "title":
-                        str(
-                            row.get(
-                                "title",
-                                "Parliamentary Question"
-                            )
-                        ),
-
-                    "text":
-                        str(
-                            row.get(
-                                "text",
-                                ""
-                            )
-                        ),
-
-                    "similarity":
-                        float(
-                            row.get(
-                                "similarity",
-                                0
-                            )
-                        ),
-
-                    "metadata":
-                        row.get(
-                            "metadata",
-                            ""
-                        ),
-                }
-            )
+    pq_sources = _group_search_results(
+        results=pq_results,
+        source_type="Parliamentary Question",
+        label_prefix="PQ",
+        max_sources=pq_top_k
+    )
 
     # --------------------------------------------------------
-    # Document sources
+    # GROUP DOCUMENT CHUNKS
     # --------------------------------------------------------
 
-    if not document_results.empty:
+    document_sources = _group_search_results(
+        results=document_results,
+        source_type="NRF Document",
+        label_prefix="DOC",
+        max_sources=document_top_k
+    )
 
-        for i, (_, row) in enumerate(
-            document_results.iterrows(),
-            start=1
-        ):
-
-            sources.append(
-                {
-                    "label":
-                        f"DOC{i}",
-
-                    "source_type":
-                        "NRF Document",
-
-                    "title":
-                        str(
-                            row.get(
-                                "title",
-                                "NRF Document"
-                            )
-                        ),
-
-                    "text":
-                        str(
-                            row.get(
-                                "text",
-                                ""
-                            )
-                        ),
-
-                    "similarity":
-                        float(
-                            row.get(
-                                "similarity",
-                                0
-                            )
-                        ),
-
-                    "metadata":
-                        row.get(
-                            "metadata",
-                            ""
-                        ),
-                }
-            )
-
-    return sources
+    return (
+        pq_sources
+        + document_sources
+    )
 
 
 # ============================================================
@@ -788,7 +1148,10 @@ def build_chatbot_context(
     sources
 ):
     """
-    Build a source-labelled evidence block for the AI.
+    Build source-labelled evidence for the AI.
+
+    Each SOURCE has one citation label even if it contains
+    several retrieved passages.
     """
 
     context_parts = []
@@ -817,7 +1180,7 @@ def build_chatbot_context(
 
         metadata = source.get(
             "metadata",
-            ""
+            {}
         )
 
         similarity = source.get(
@@ -825,31 +1188,26 @@ def build_chatbot_context(
             0
         )
 
-        if isinstance(
-            metadata,
-            str
-        ):
+        passage_count = source.get(
+            "passage_count",
+            1
+        )
 
-            try:
-                metadata = json.loads(metadata)
-            except Exception:
-                metadata = {}
-
-        if not isinstance(
-            metadata,
-            dict
-        ):
-            metadata = {}
+        metadata = _parse_source_metadata(
+            metadata
+        )
 
         context_parts.append(
             f"""
 SOURCE [{label}]
 Source type: {source_type}
 Title: {title}
+Number of retrieved passages from this source: {passage_count}
 Retrieval relevance: {similarity:.1%}
 Metadata: {json.dumps(metadata, ensure_ascii=False)}
 
-Relevant passage:
+Relevant evidence from [{label}]:
+
 {text}
 """.strip()
         )
@@ -867,11 +1225,6 @@ def build_recent_chat_history(
     messages,
     max_messages=8
 ):
-    """
-    Provide a limited amount of conversational history
-    to the model while preventing the prompt from growing
-    indefinitely.
-    """
 
     if not messages:
         return ""
@@ -919,9 +1272,6 @@ def generate_chatbot_answer(
     sources,
     chat_history
 ):
-    """
-    Generate an answer grounded only in retrieved NRF sources.
-    """
 
     client = get_openai_client()
 
@@ -931,6 +1281,7 @@ def generate_chatbot_answer(
         )
 
     if not sources:
+
         return (
             "I could not find sufficiently relevant information "
             "in the Parliamentary Questions or uploaded NRF "
@@ -945,35 +1296,68 @@ def generate_chatbot_answer(
         chat_history
     )
 
+    valid_labels = [
+        source.get(
+            "label",
+            ""
+        )
+        for source in sources
+        if source.get(
+            "label"
+        )
+    ]
+
+    valid_labels_text = ", ".join(
+        f"[{label}]"
+        for label in valid_labels
+    )
+
     instructions = """
 You are the NRF Knowledge AI Assistant.
 
-Your task is to answer questions using ONLY the evidence supplied
+Your task is to answer questions using ONLY evidence supplied
 from the NRF knowledge repository.
 
 The repository contains:
+
 1. Historical Parliamentary Questions and NRF answers.
 2. NRF-related uploaded documents.
 
-IMPORTANT RULES:
+IMPORTANT SOURCE AND CITATION RULES:
 
-- Ground all factual claims in the supplied sources.
+- Ground factual claims in the supplied evidence.
 - Do not invent NRF positions, policies, programmes, statistics,
   dates, commitments or explanations.
 - If the evidence is insufficient, say that the repository does
   not contain enough information to answer confidently.
-- Where useful, distinguish between what NRF said in a
-  Parliamentary Question and what appears in an NRF document.
-- Cite supporting evidence inline using the exact source labels,
-  for example [PQ1], [PQ2], [DOC1].
-- Never invent source labels.
-- Multiple sources may be cited together, for example
-  [PQ1][DOC2].
+
+- Each [DOC#] represents ONE UNIQUE uploaded NRF document.
+- Several relevant passages may appear underneath the same [DOC#].
+- These passages are NOT separate documents.
+- Never create a new citation number for an individual passage.
+
+- Each [PQ#] represents ONE UNIQUE Parliamentary Question.
+- Several passages belonging to the same PQ share that citation.
+
+- Use ONLY the citation labels explicitly supplied in the
+  retrieved evidence.
+- Never invent a citation label.
+- Never increment a citation number yourself.
+- Never infer that passage 2 means DOC2.
+- Cite the SOURCE label attached to that passage.
+
+- Cite supporting evidence inline, for example:
+  [PQ1]
+  [DOC1]
+  [PQ1][DOC2]
+
+- Where useful, distinguish between evidence from Parliamentary
+  Questions and evidence from uploaded NRF documents.
+
 - Prefer synthesis over copying source text.
 - Answer directly and clearly.
 - Use concise headings or bullets only when they improve clarity.
 - Do not mention semantic similarity scores.
-- Do not claim to have searched sources that were not supplied.
 """
 
     prompt = f"""
@@ -987,13 +1371,27 @@ RECENT CONVERSATION
 {recent_history or "No previous conversation."}
 
 
+VALID CITATION LABELS
+
+You may ONLY use these citation labels:
+
+{valid_labels_text}
+
+
 RETRIEVED NRF EVIDENCE
 
 {context}
 
 
 Answer the current user question using the retrieved NRF evidence.
-Use inline citations such as [PQ1] and [DOC1].
+
+Remember:
+
+A citation identifies the UNIQUE SOURCE, not an individual
+retrieved passage.
+
+Do not create any citation label that is not in the VALID
+CITATION LABELS list.
 """
 
     model = get_openai_model()
@@ -1071,10 +1469,6 @@ with tab_chat:
         """
     )
 
-    # --------------------------------------------------------
-    # API status
-    # --------------------------------------------------------
-
     api_key = get_openai_api_key()
 
     if not api_key:
@@ -1131,7 +1525,7 @@ with tab_chat:
         ] = {}
 
     # --------------------------------------------------------
-    # Chat controls
+    # Clear chat
     # --------------------------------------------------------
 
     control_col1, control_col2 = st.columns(
@@ -1156,7 +1550,7 @@ with tab_chat:
             st.rerun()
 
     # --------------------------------------------------------
-    # Welcome message
+    # Welcome
     # --------------------------------------------------------
 
     if not st.session_state[
@@ -1170,7 +1564,7 @@ with tab_chat:
             st.markdown(
                 """
                 Hello. I can answer questions using the NRF
-                repository.
+                knowledge repository.
 
                 For example:
 
@@ -1179,13 +1573,13 @@ with tab_chat:
                   about R&D funding?
                 - What do our uploaded documents say about
                   research manpower?
-                - Compare NRF's Parliamentary responses with
-                  the relevant strategy documents.
+                - Compare Parliamentary responses with the
+                  relevant NRF documents.
                 """
             )
 
     # --------------------------------------------------------
-    # Existing chat
+    # Existing chat messages
     # --------------------------------------------------------
 
     for message_index, message in enumerate(
@@ -1213,8 +1607,7 @@ with tab_chat:
                 sources = (
                     st.session_state[
                         "nrf_chat_sources"
-                    ]
-                    .get(
+                    ].get(
                         str(message_index),
                         []
                     )
@@ -1233,11 +1626,9 @@ with tab_chat:
                                 ""
                             )
 
-                            source_type = (
-                                source.get(
-                                    "source_type",
-                                    ""
-                                )
+                            source_type = source.get(
+                                "source_type",
+                                ""
                             )
 
                             title = source.get(
@@ -1255,6 +1646,11 @@ with tab_chat:
                                 0
                             )
 
+                            passage_count = source.get(
+                                "passage_count",
+                                1
+                            )
+
                             if (
                                 source_type
                                 == "Parliamentary Question"
@@ -1269,7 +1665,9 @@ with tab_chat:
                             )
 
                             st.caption(
-                                f"Retrieval relevance: "
+                                f"{passage_count} relevant "
+                                f"passage(s) retrieved • "
+                                f"Best relevance: "
                                 f"{similarity:.1%}"
                             )
 
@@ -1278,7 +1676,7 @@ with tab_chat:
                             st.markdown("---")
 
     # --------------------------------------------------------
-    # User input
+    # New question
     # --------------------------------------------------------
 
     user_question = st.chat_input(
@@ -1287,19 +1685,12 @@ with tab_chat:
 
     if user_question:
 
-        # ----------------------------------------------------
-        # Save user message
-        # ----------------------------------------------------
-
         st.session_state[
             "nrf_chat_messages"
         ].append(
             {
-                "role":
-                    "user",
-
-                "content":
-                    user_question
+                "role": "user",
+                "content": user_question
             }
         )
 
@@ -1310,10 +1701,6 @@ with tab_chat:
             st.markdown(
                 user_question
             )
-
-        # ----------------------------------------------------
-        # Retrieve evidence
-        # ----------------------------------------------------
 
         with st.chat_message(
             "assistant"
@@ -1332,10 +1719,6 @@ with tab_chat:
                         min_similarity=0.20
                     )
                 )
-
-            # ------------------------------------------------
-            # Generate response
-            # ------------------------------------------------
 
             if not sources:
 
@@ -1391,7 +1774,7 @@ with tab_chat:
             st.markdown(answer)
 
             # ------------------------------------------------
-            # Display sources immediately
+            # Sources
             # ------------------------------------------------
 
             if sources:
@@ -1427,6 +1810,11 @@ with tab_chat:
                             0
                         )
 
+                        passage_count = source.get(
+                            "passage_count",
+                            1
+                        )
+
                         if (
                             source_type
                             == "Parliamentary Question"
@@ -1441,17 +1829,15 @@ with tab_chat:
                         )
 
                         st.caption(
-                            f"Retrieval relevance: "
+                            f"{passage_count} relevant "
+                            f"passage(s) retrieved • "
+                            f"Best relevance: "
                             f"{similarity:.1%}"
                         )
 
                         st.write(text)
 
                         st.markdown("---")
-
-        # ----------------------------------------------------
-        # Save assistant message and source mapping
-        # ----------------------------------------------------
 
         assistant_index = len(
             st.session_state[
@@ -1463,11 +1849,8 @@ with tab_chat:
             "nrf_chat_messages"
         ].append(
             {
-                "role":
-                    "assistant",
-
-                "content":
-                    answer
+                "role": "assistant",
+                "content": answer
             }
         )
 
@@ -1554,11 +1937,7 @@ with tab_pq:
             )
 
             source = st.text_input(
-                "Source / Reference",
-                placeholder=(
-                    "e.g. Parliamentary Sitting, "
-                    "Hansard reference"
-                )
+                "Source / Reference"
             )
 
             submitted = st.form_submit_button(
@@ -1605,14 +1984,12 @@ with tab_pq:
 
                         st.warning(
                             "This Parliamentary Question "
-                            "already appears to exist in "
-                            "the repository."
+                            "already appears to exist."
                         )
 
                     else:
 
                         new_pq = {
-
                             "pq_id":
                                 generate_id("PQ"),
 
@@ -1683,15 +2060,14 @@ with tab_pq:
                         else:
 
                             st.warning(
-                                "Parliamentary Question was saved, "
-                                "but the semantic search index "
-                                "could not be rebuilt."
+                                "PQ saved, but the semantic "
+                                "search index could not be rebuilt."
                             )
 
                         st.rerun()
 
     # ========================================================
-    # PQ SEARCH / FILTER
+    # PQ FILTER
     # ========================================================
 
     st.markdown("---")
@@ -1745,36 +2121,11 @@ with tab_pq:
                 lambda row:
                     q in " ".join(
                         [
-                            str(
-                                row.get(
-                                    "mp_name",
-                                    ""
-                                )
-                            ),
-                            str(
-                                row.get(
-                                    "question",
-                                    ""
-                                )
-                            ),
-                            str(
-                                row.get(
-                                    "answer",
-                                    ""
-                                )
-                            ),
-                            str(
-                                row.get(
-                                    "topic",
-                                    ""
-                                )
-                            ),
-                            str(
-                                row.get(
-                                    "keywords",
-                                    ""
-                                )
-                            )
+                            str(row.get("mp_name", "")),
+                            str(row.get("question", "")),
+                            str(row.get("answer", "")),
+                            str(row.get("topic", "")),
+                            str(row.get("keywords", ""))
                         ]
                     ).lower(),
                 axis=1
@@ -1858,8 +2209,6 @@ with tab_pq:
                         f"Source: {row['source']}"
                     )
 
-                st.markdown("---")
-
                 if st.button(
                     "🗑️ Delete",
                     key=f"delete_pq_{row['pq_id']}"
@@ -1875,29 +2224,10 @@ with tab_pq:
                         PQ_METADATA_FILE
                     )
 
-                    with st.spinner(
-                        "Updating search index..."
-                    ):
-
-                        index_ok, _ = (
-                            rebuild_search_index_safe(
-                                pq_df,
-                                document_df
-                            )
-                        )
-
-                    if index_ok:
-
-                        st.success(
-                            "Parliamentary Question deleted."
-                        )
-
-                    else:
-
-                        st.warning(
-                            "Parliamentary Question deleted, "
-                            "but the search index rebuild failed."
-                        )
+                    rebuild_search_index_safe(
+                        pq_df,
+                        document_df
+                    )
 
                     st.rerun()
 
@@ -1915,8 +2245,10 @@ with tab_documents:
     st.write(
         """
         Upload NRF-related PDF, Word, Excel and text documents.
-        Uploaded documents are extracted, chunked and added
-        to the semantic search index.
+
+        Each uploaded file is treated as ONE unique document for
+        chatbot citations, even though it may be divided into
+        several semantic-search chunks internally.
         """
     )
 
@@ -2026,12 +2358,6 @@ with tab_documents:
 
                 except Exception as exc:
 
-                    logger.exception(
-                        "Could not save uploaded file %s: %s",
-                        uploaded_file.name,
-                        exc
-                    )
-
                     st.error(
                         f"Could not save "
                         f"`{uploaded_file.name}`: {exc}"
@@ -2061,6 +2387,8 @@ with tab_documents:
 
                     continue
 
+                # IMPORTANT:
+                # One permanent ID is created per uploaded file.
                 document_id = generate_id(
                     "DOC"
                 )
@@ -2125,16 +2453,14 @@ with tab_documents:
 
                     st.success(
                         f"`{uploaded_file.name}` successfully "
-                        f"added to the NRF repository "
-                        f"and search index."
+                        "added to the NRF repository."
                     )
 
                 else:
 
                     st.warning(
-                        f"`{uploaded_file.name}` was added "
-                        f"to the repository, but the search "
-                        f"index rebuild failed."
+                        f"`{uploaded_file.name}` was added, "
+                        "but the search index rebuild failed."
                     )
 
     st.markdown("---")
@@ -2177,6 +2503,11 @@ with tab_documents:
             with st.expander(
                 f"📄 {document_title_display}"
             ):
+
+                st.caption(
+                    f"Document ID: "
+                    f"{row['document_id']}"
+                )
 
                 st.caption(
                     f"Filename: {row['filename']}"
@@ -2238,25 +2569,12 @@ with tab_documents:
                                 )
                             )
 
-                        except Exception as exc:
-
-                            logger.warning(
-                                "Could not open repository "
-                                "document %s: %s",
-                                filepath,
-                                exc
-                            )
+                        except Exception:
 
                             st.caption(
                                 "⚠️ Stored file could not "
                                 "be opened."
                             )
-
-                    else:
-
-                        st.caption(
-                            "⚠️ Stored file is missing."
-                        )
 
                 with col2:
 
@@ -2279,15 +2597,8 @@ with tab_documents:
 
                             try:
                                 os.remove(filepath)
-
-                            except Exception as exc:
-
-                                logger.warning(
-                                    "Could not delete file "
-                                    "%s: %s",
-                                    filepath,
-                                    exc
-                                )
+                            except Exception:
+                                pass
 
                         document_df = document_df[
                             document_df[
@@ -2301,29 +2612,10 @@ with tab_documents:
                             DOCUMENT_METADATA_FILE
                         )
 
-                        with st.spinner(
-                            "Updating search index..."
-                        ):
-
-                            index_ok, _ = (
-                                rebuild_search_index_safe(
-                                    pq_df,
-                                    document_df
-                                )
-                            )
-
-                        if index_ok:
-
-                            st.success(
-                                "Document deleted."
-                            )
-
-                        else:
-
-                            st.warning(
-                                "Document deleted, but the "
-                                "search index rebuild failed."
-                            )
+                        rebuild_search_index_safe(
+                            pq_df,
+                            document_df
+                        )
 
                         st.rerun()
 
@@ -2349,7 +2641,10 @@ with tab_admin:
     )
 
     try:
-        search_index = PQAI.load_search_index()
+
+        search_index = (
+            PQAI.load_search_index()
+        )
 
     except Exception as exc:
 
@@ -2389,13 +2684,6 @@ with tab_admin:
         "🔄 Search Index"
     )
 
-    st.write(
-        """
-        Rebuild the semantic search index after adding or
-        modifying repository files outside the application.
-        """
-    )
-
     if st.button(
         "🔄 Rebuild Semantic Search Index",
         type="primary"
@@ -2422,9 +2710,7 @@ with tab_admin:
         else:
 
             st.error(
-                "Search index rebuild failed. "
-                "Check the application logs for the "
-                "underlying PQAI error."
+                "Search index rebuild failed."
             )
 
     st.markdown("---")
@@ -2436,7 +2722,10 @@ with tab_admin:
     embeddings = None
 
     try:
-        embeddings = PQAI.load_embeddings()
+
+        embeddings = (
+            PQAI.load_embeddings()
+        )
 
     except Exception as exc:
 
@@ -2445,18 +2734,27 @@ with tab_admin:
             exc
         )
 
-    index_count = len(search_index)
+    index_count = len(
+        search_index
+    )
 
     if embeddings is None:
+
         embedding_count = 0
 
     else:
+
         try:
-            embedding_count = len(embeddings)
+            embedding_count = len(
+                embeddings
+            )
+
         except TypeError:
             embedding_count = 0
 
-    health_col1, health_col2 = st.columns(2)
+    health_col1, health_col2 = st.columns(
+        2
+    )
 
     with health_col1:
 
@@ -2473,7 +2771,8 @@ with tab_admin:
         )
 
     if (
-        index_count == embedding_count
+        index_count
+        == embedding_count
         and index_count > 0
     ):
 
