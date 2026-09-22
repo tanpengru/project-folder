@@ -27,7 +27,19 @@ import hashlib
 import json
 import importlib
 import logging
+import io
+from collections import Counter
 from datetime import datetime
+
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+try:
+    from sklearn.linear_model import LinearRegression
+except ImportError:
+    LinearRegression = None
 
 import streamlit as st
 import pandas as pd
@@ -1416,6 +1428,375 @@ CITATION LABELS list.
     return answer.strip()
 
 
+
+# ============================================================
+# 🌐 SINGAPORE HANSARD — LIVE SEARCH / ANALYTICS
+# ============================================================
+
+HANSARD_BASE_URL = "https://sprs.parl.gov.sg"
+HANSARD_SEARCH_URL = "https://sprs.parl.gov.sg/search/"
+HANSARD_DISPLAY_ENDPOINT = "https://sprs.parl.gov.sg/search/getDisplayData"
+HANSARD_TIMEOUT = 30
+HANSARD_COLUMNS = [
+    "date", "parliament", "title", "speaker", "content", "url", "source"
+]
+
+
+def _clean_hansard_text(value):
+    if value is None:
+        return ""
+    text = BeautifulSoup(str(value), "html.parser").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _first_hansard_value(record, *keys):
+    if not isinstance(record, dict):
+        return ""
+    lowered = {str(k).lower(): v for k, v in record.items()}
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, "", [], {}):
+            return value
+        value = lowered.get(str(key).lower())
+        if value not in (None, "", [], {}):
+            return value
+    return ""
+
+
+def _extract_records_from_json(payload):
+    candidates = []
+
+    def walk(value):
+        if isinstance(value, list):
+            if value and all(isinstance(item, dict) for item in value):
+                candidates.append(value)
+            for item in value:
+                walk(item)
+        elif isinstance(value, dict):
+            for child in value.values():
+                walk(child)
+
+    walk(payload)
+    if not candidates:
+        return []
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
+def _normalise_hansard_record(record):
+    title = _clean_hansard_text(_first_hansard_value(
+        record, "title", "Title", "reportTitle", "report_title",
+        "subject", "topic", "heading"
+    ))
+    content = _clean_hansard_text(_first_hansard_value(
+        record, "content", "Content", "text", "Text", "snippet", "Snippet",
+        "displayText", "description", "body"
+    ))
+    speaker = _clean_hansard_text(_first_hansard_value(
+        record, "speaker", "Speaker", "member", "Member", "mp", "MP", "name"
+    ))
+    date_value = _first_hansard_value(
+        record, "date", "Date", "sittingDate", "sitting_date",
+        "reportDate", "report_date"
+    )
+    parliament = _clean_hansard_text(_first_hansard_value(
+        record, "parliament", "Parliament", "parliamentNo",
+        "parliamentNumber", "session"
+    ))
+    raw_url = str(_first_hansard_value(
+        record, "url", "URL", "link", "Link", "href", "reportUrl", "reportURL"
+    ) or "").strip()
+
+    return {
+        "date": _clean_hansard_text(date_value),
+        "parliament": parliament,
+        "title": title,
+        "speaker": speaker,
+        "content": content,
+        "url": urljoin(HANSARD_BASE_URL, raw_url) if raw_url else "",
+        "source": "Singapore Parliament Hansard",
+    }
+
+
+def _parse_hansard_html_results(html):
+    soup = BeautifulSoup(html, "html.parser")
+    records, seen = [], set()
+    for link in soup.find_all("a", href=True):
+        title = _clean_hansard_text(link.get_text(" ", strip=True))
+        href = str(link.get("href", "")).strip()
+        if not title:
+            continue
+        combined = f"{title.lower()} {href.lower()}"
+        if not any(x in combined for x in ("report", "sitting", "sprs", "hansard")):
+            continue
+        url = urljoin(HANSARD_BASE_URL, href)
+        identity = (url, title)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        parent_text = link.parent.get_text(" ", strip=True) if link.parent else ""
+        records.append({
+            "date": "", "parliament": "", "title": title, "speaker": "",
+            "content": parent_text, "url": url,
+            "source": "Singapore Parliament Hansard",
+        })
+    return records
+
+
+def search_hansard_live(
+    query, start_date=None, end_date=None,
+    search_mode="Any of the words", title_only=False, max_results=100
+):
+    query = str(query or "").strip()
+    if not query:
+        return pd.DataFrame(columns=HANSARD_COLUMNS), "Please enter a Hansard search query."
+
+    option_map = {
+        "All the words": "all", "Any of the words": "any",
+        "Exact phrase": "exact", "Custom search": "custom",
+    }
+    option = option_map.get(search_mode, "any")
+    start = start_date.strftime("%d/%m/%Y") if start_date else ""
+    end = end_date.strftime("%d/%m/%Y") if end_date else ""
+
+    payloads = [
+        {
+            "searchTerm": query, "keyword": query, "searchOption": option,
+            "titleOnly": title_only, "startDate": start, "endDate": end,
+            "page": 1, "pageSize": max_results,
+        },
+        {
+            "keyword": query, "searchOption": option, "searchTitle": title_only,
+            "fromDate": start, "toDate": end, "pageNo": 1,
+            "pageSize": max_results,
+        },
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": HANSARD_SEARCH_URL,
+    }
+    session = requests.Session()
+    errors = []
+    try:
+        session.get(HANSARD_SEARCH_URL, headers=headers, timeout=HANSARD_TIMEOUT)
+    except Exception as exc:
+        logger.warning("Could not initialise Hansard session: %s", exc)
+
+    for payload in payloads:
+        for method in ("post", "get"):
+            try:
+                if method == "post":
+                    response = session.post(
+                        HANSARD_DISPLAY_ENDPOINT, json=payload,
+                        headers=headers, timeout=HANSARD_TIMEOUT
+                    )
+                else:
+                    response = session.get(
+                        HANSARD_DISPLAY_ENDPOINT, params=payload,
+                        headers=headers, timeout=HANSARD_TIMEOUT
+                    )
+                if not response.ok:
+                    continue
+                try:
+                    raw = _extract_records_from_json(response.json())
+                    records = [_normalise_hansard_record(r) for r in raw]
+                except Exception:
+                    records = _parse_hansard_html_results(response.text)
+
+                records = [r for r in records if r.get("title") or r.get("content")]
+                if records:
+                    df = pd.DataFrame(records)
+                    for col in HANSARD_COLUMNS:
+                        if col not in df.columns:
+                            df[col] = ""
+                    df = (df[HANSARD_COLUMNS]
+                          .drop_duplicates(subset=["date", "title", "url"])
+                          .head(max_results).reset_index(drop=True))
+                    return df, ""
+            except Exception as exc:
+                errors.append(f"{method.upper()}: {exc}")
+
+    logger.warning("Hansard live search unsuccessful: %s", " | ".join(errors))
+    return pd.DataFrame(columns=HANSARD_COLUMNS), (
+        "The Singapore Parliament Hansard search endpoint did not return readable "
+        "results. The Parliament website may have changed its internal search format."
+    )
+
+
+def prepare_hansard_dataframe(dataframe):
+    if dataframe is None or dataframe.empty:
+        return pd.DataFrame(columns=HANSARD_COLUMNS)
+    df = dataframe.copy()
+    for col in HANSARD_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df["date_parsed"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    df["year"] = df["date_parsed"].dt.year
+    df["month"] = df["date_parsed"].dt.to_period("M").astype(str)
+    df["quarter"] = df["date_parsed"].dt.to_period("Q").astype(str)
+    df["combined_text"] = (
+        df["title"].fillna("").astype(str) + " " +
+        df["content"].fillna("").astype(str)
+    ).str.strip()
+    return df
+
+
+def hansard_yearly_counts(dataframe):
+    df = prepare_hansard_dataframe(dataframe).dropna(subset=["year"])
+    if df.empty:
+        return pd.DataFrame(columns=["year", "records"])
+    result = df.groupby("year").size().reset_index(name="records").sort_values("year")
+    result["year"] = result["year"].astype(int)
+    return result
+
+
+def hansard_monthly_counts(dataframe):
+    df = prepare_hansard_dataframe(dataframe).dropna(subset=["date_parsed"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["month", "records"])
+    df["month_period"] = df["date_parsed"].dt.to_period("M")
+    result = (df.groupby("month_period").size().reset_index(name="records")
+              .sort_values("month_period"))
+    result["month"] = result["month_period"].dt.to_timestamp()
+    return result[["month", "records"]]
+
+
+def hansard_top_speakers(dataframe, top_n=15):
+    if dataframe is None or dataframe.empty or "speaker" not in dataframe.columns:
+        return pd.DataFrame(columns=["speaker", "records"])
+    s = dataframe["speaker"].fillna("").astype(str).str.strip()
+    s = s[s != ""]
+    if s.empty:
+        return pd.DataFrame(columns=["speaker", "records"])
+    return s.value_counts().head(top_n).rename_axis("speaker").reset_index(name="records")
+
+
+HANSARD_STOPWORDS = {
+    "the", "and", "that", "this", "with", "from", "have", "has", "had", "for",
+    "are", "was", "were", "will", "would", "could", "should", "there", "their",
+    "they", "them", "into", "about", "which", "when", "where", "what", "who",
+    "why", "how", "not", "but", "can", "our", "your", "you", "his", "her",
+    "its", "also", "been", "being", "than", "then", "these", "those", "such",
+    "more", "may", "parliament", "minister", "member", "members", "singapore",
+}
+
+
+def hansard_top_terms(dataframe, top_n=25):
+    if dataframe is None or dataframe.empty:
+        return pd.DataFrame(columns=["term", "count"])
+    df = prepare_hansard_dataframe(dataframe)
+    text = " ".join(df["combined_text"].fillna("").astype(str).tolist()).lower()
+    words = re.findall(r"\b[a-z][a-z\-]{2,}\b", text)
+    words = [w for w in words if w not in HANSARD_STOPWORDS]
+    return pd.DataFrame(Counter(words).most_common(top_n), columns=["term", "count"])
+
+
+def forecast_hansard_volume(dataframe, periods=6):
+    monthly = hansard_monthly_counts(dataframe)
+    if len(monthly) < 4:
+        return pd.DataFrame(), "At least four months of dated Hansard results are required."
+    if LinearRegression is None:
+        return pd.DataFrame(), "scikit-learn is not installed."
+
+    full_range = pd.date_range(monthly["month"].min(), monthly["month"].max(), freq="MS")
+    monthly = (monthly.set_index("month").reindex(full_range, fill_value=0)
+               .rename_axis("month").reset_index())
+    monthly["t"] = np.arange(len(monthly))
+    X = monthly[["t"]].values
+    y = monthly["records"].astype(float).values
+    model = LinearRegression().fit(X, y)
+    fitted = model.predict(X)
+    residuals = y - fitted
+    residual_std = float(np.std(residuals, ddof=1)) if len(residuals) > 2 else 0.0
+
+    future_t = np.arange(len(monthly), len(monthly) + periods)
+    predictions = np.maximum(model.predict(future_t.reshape(-1, 1)), 0)
+    future_months = pd.date_range(
+        monthly["month"].max() + pd.offsets.MonthBegin(1), periods=periods, freq="MS"
+    )
+    margin = 1.96 * residual_std
+    forecast = pd.DataFrame({
+        "month": future_months,
+        "forecast": predictions,
+        "lower_95": np.maximum(predictions - margin, 0),
+        "upper_95": predictions + margin,
+        "type": "Forecast",
+    })
+    history = monthly[["month", "records"]].copy()
+    history["type"] = "Historical"
+    forecast["records"] = np.nan
+    return pd.concat([history, forecast], ignore_index=True, sort=False), ""
+
+
+def generate_hansard_ai_analysis(question, hansard_df):
+    client = get_openai_client()
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY has not been configured.")
+    if hansard_df is None or hansard_df.empty:
+        return "No Hansard results are currently available for analysis."
+
+    source_parts = []
+    for i, (_, row) in enumerate(hansard_df.head(100).iterrows(), start=1):
+        source_parts.append(
+            f"""[H{i}]
+Date: {row.get("date", "")}
+Parliament: {row.get("parliament", "")}
+Title: {row.get("title", "")}
+Speaker: {row.get("speaker", "")}
+Source URL: {row.get("url", "")}
+
+Text:
+{row.get("content", "")}"""
+        )
+
+    instructions = """
+You are analysing Singapore Parliament Hansard search results.
+Use ONLY the Hansard evidence supplied in the prompt.
+Do not invent parliamentary statements, dates, speakers, statistics, policy positions
+or trends. Distinguish observations in the retrieved dataset from conclusions about
+Parliament as a whole. Cite evidence with the supplied [H#] labels only.
+Do not predict political behaviour, election outcomes, government decisions or
+individual MPs' future positions. Statistical forecasts concern record/query volume only.
+"""
+    response = client.responses.create(
+        model=get_openai_model(),
+        instructions=instructions,
+        input=f"""USER ANALYSIS QUESTION
+
+{question}
+
+HANSARD SEARCH RESULTS
+
+{chr(10).join(source_parts)}
+
+Answer using only these Hansard results."""
+    )
+    answer = getattr(response, "output_text", "")
+    if not answer:
+        raise RuntimeError("The AI model returned an empty response.")
+    return answer.strip()
+
+
+def hansard_csv_bytes(dataframe):
+    return dataframe.to_csv(index=False).encode("utf-8-sig")
+
+
+def hansard_excel_bytes(dataframe):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        dataframe.to_excel(writer, index=False, sheet_name="Hansard Results")
+        yearly = hansard_yearly_counts(dataframe)
+        if not yearly.empty:
+            yearly.to_excel(writer, index=False, sheet_name="Yearly Analytics")
+        terms = hansard_top_terms(dataframe)
+        if not terms.empty:
+            terms.to_excel(writer, index=False, sheet_name="Top Terms")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
 # ============================================================
 # 📚 LOAD REPOSITORIES
 # ============================================================
@@ -1435,9 +1816,10 @@ document_df = load_csv(
 # 🧭 MAIN NAVIGATION
 # ============================================================
 
-tab_chat, tab_pq, tab_documents, tab_admin = st.tabs(
+tab_chat, tab_hansard, tab_pq, tab_documents, tab_admin = st.tabs(
     [
         "🤖 NRF AI Chatbot",
+        "🌐 Live Hansard",
         "🏛️ Parliamentary Questions",
         "📚 NRF Documents",
         "⚙️ Repository Management",
@@ -1861,8 +2243,275 @@ with tab_chat:
         ] = sources
 
 
+
 # ============================================================
-# 🏛️ TAB 2 — PARLIAMENTARY QUESTIONS
+# 🌐 TAB 2 — LIVE SINGAPORE HANSARD
+# ============================================================
+
+with tab_hansard:
+    st.header("🌐 Singapore Hansard Live Search & Analytics")
+    st.markdown("""
+    Search the **Singapore Parliament Official Reports (Hansard)** separately
+    from the NRF knowledge repository. Live results are not automatically added
+    to the NRF semantic search index.
+    """)
+
+    st.link_button("🏛️ Open Official Singapore Hansard", HANSARD_SEARCH_URL)
+
+    if "hansard_results" not in st.session_state:
+        st.session_state["hansard_results"] = pd.DataFrame(columns=HANSARD_COLUMNS)
+    if "hansard_query" not in st.session_state:
+        st.session_state["hansard_query"] = ""
+
+    st.subheader("🔎 Live Hansard Search")
+
+    with st.form("hansard_search_form"):
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            hansard_query = st.text_input(
+                "Search Hansard",
+                placeholder="e.g. artificial intelligence, research funding, quantum"
+            )
+        with c2:
+            hansard_max_results = st.selectbox(
+                "Maximum results", [25, 50, 100, 200], index=2
+            )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            hansard_search_mode = st.selectbox(
+                "Search mode",
+                ["Any of the words", "All the words", "Exact phrase", "Custom search"]
+            )
+        with c2:
+            hansard_title_only = st.checkbox("Search within titles only")
+
+        use_date_filter = st.checkbox("Limit search by date")
+        hansard_start_date = hansard_end_date = None
+        if use_date_filter:
+            c1, c2 = st.columns(2)
+            with c1:
+                hansard_start_date = st.date_input(
+                    "From date", value=datetime(2015, 1, 1).date()
+                )
+            with c2:
+                hansard_end_date = st.date_input(
+                    "To date", value=datetime.now().date()
+                )
+
+        hansard_search_submit = st.form_submit_button(
+            "🔎 Search Live Hansard", type="primary", use_container_width=True
+        )
+
+    if hansard_search_submit:
+        if not hansard_query.strip():
+            st.warning("Enter a keyword or phrase to search.")
+        elif (use_date_filter and hansard_start_date and hansard_end_date
+              and hansard_start_date > hansard_end_date):
+            st.error("The start date cannot be after the end date.")
+        else:
+            with st.spinner("Searching the Singapore Parliament Hansard database..."):
+                live_results, search_error = search_hansard_live(
+                    query=hansard_query,
+                    start_date=hansard_start_date if use_date_filter else None,
+                    end_date=hansard_end_date if use_date_filter else None,
+                    search_mode=hansard_search_mode,
+                    title_only=hansard_title_only,
+                    max_results=hansard_max_results,
+                )
+            st.session_state["hansard_results"] = live_results
+            st.session_state["hansard_query"] = hansard_query
+            if search_error:
+                st.warning(search_error)
+            if live_results.empty:
+                st.info("No readable Hansard results were returned for this search.")
+            else:
+                st.success(f"{len(live_results)} Hansard record(s) retrieved.")
+
+    hansard_results = st.session_state["hansard_results"]
+
+    if hansard_results is not None and not hansard_results.empty:
+        prepared_hansard = prepare_hansard_dataframe(hansard_results)
+        st.markdown("---")
+        st.subheader("📚 Current Hansard Dataset")
+        if st.session_state.get("hansard_query"):
+            st.caption(f"Current search: {st.session_state['hansard_query']}")
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Records", len(prepared_hansard))
+        with m2:
+            st.metric("Dated records", int(prepared_hansard["date_parsed"].notna().sum()))
+        with m3:
+            speakers = prepared_hansard["speaker"].fillna("").astype(str).str.strip()
+            st.metric("Speakers", speakers[speakers != ""].nunique())
+        with m4:
+            years = prepared_hansard["year"].dropna()
+            if years.empty:
+                year_range = "—"
+            else:
+                lo, hi = int(years.min()), int(years.max())
+                year_range = str(lo) if lo == hi else f"{lo}–{hi}"
+            st.metric("Period", year_range)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "⬇️ Download CSV",
+                data=hansard_csv_bytes(hansard_results),
+                file_name="singapore_hansard_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with c2:
+            try:
+                st.download_button(
+                    "⬇️ Download Excel",
+                    data=hansard_excel_bytes(hansard_results),
+                    file_name="singapore_hansard_analysis.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.caption(f"Excel export unavailable: {exc}")
+
+        result_tab, ai_tab, analytics_tab, forecast_tab = st.tabs(
+            ["📄 Results", "🤖 AI Analysis", "📊 Analytics", "📈 Forecast"]
+        )
+
+        with result_tab:
+            st.subheader("Hansard Search Results")
+            display_cols = [
+                c for c in ["date", "parliament", "speaker", "title"]
+                if c in prepared_hansard.columns
+            ]
+            st.dataframe(
+                prepared_hansard[display_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.markdown("---")
+            for index, row in prepared_hansard.iterrows():
+                title = row.get("title", "") or "Hansard Record"
+                date = row.get("date", "")
+                label = f"🏛️ {date} — {title}" if date else f"🏛️ {title}"
+                with st.expander(label):
+                    if row.get("speaker", ""):
+                        st.markdown(f"**Speaker:** {row.get('speaker', '')}")
+                    if row.get("parliament", ""):
+                        st.caption(f"Parliament: {row.get('parliament', '')}")
+                    if row.get("content", ""):
+                        st.write(row.get("content", ""))
+                    if row.get("url", ""):
+                        st.link_button(
+                            "🔗 Open Official Hansard Record",
+                            row.get("url", ""),
+                            key=f"hansard_link_{index}",
+                        )
+
+        with ai_tab:
+            st.subheader("🤖 Analyse Retrieved Hansard Records")
+            hansard_ai_question = st.text_area(
+                "Analysis question",
+                placeholder="e.g. What themes have emerged in discussion of AI?",
+                height=120,
+            )
+            if st.button("🤖 Analyse Hansard", type="primary", key="analyse_hansard"):
+                if not hansard_ai_question.strip():
+                    st.warning("Enter an analysis question.")
+                elif not get_openai_api_key():
+                    st.error("OPENAI_API_KEY has not been configured.")
+                else:
+                    try:
+                        with st.spinner("Analysing retrieved Hansard records..."):
+                            answer = generate_hansard_ai_analysis(
+                                hansard_ai_question, prepared_hansard
+                            )
+                        st.markdown(answer)
+                    except Exception as exc:
+                        logger.exception("Hansard AI analysis failed: %s", exc)
+                        st.error(f"Hansard analysis failed: {exc}")
+
+        with analytics_tab:
+            st.subheader("📊 Hansard Data Analytics")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("### Records by Year")
+                yearly = hansard_yearly_counts(prepared_hansard)
+                if yearly.empty:
+                    st.info("The retrieved records do not contain enough usable dates.")
+                else:
+                    st.bar_chart(yearly, x="year", y="records")
+            with c2:
+                st.markdown("### Most Frequent Speakers")
+                speaker_counts = hansard_top_speakers(prepared_hansard)
+                if speaker_counts.empty:
+                    st.info("Speaker information is not available in these results.")
+                else:
+                    st.bar_chart(speaker_counts, x="speaker", y="records")
+
+            st.markdown("### Parliamentary Attention Over Time")
+            monthly = hansard_monthly_counts(prepared_hansard)
+            if monthly.empty:
+                st.info("Monthly trend analysis requires dated Hansard records.")
+            else:
+                st.line_chart(monthly, x="month", y="records")
+
+            st.markdown("### Most Frequent Terms")
+            terms = hansard_top_terms(prepared_hansard)
+            if terms.empty:
+                st.info("No terms could be extracted.")
+            else:
+                st.bar_chart(terms, x="term", y="count")
+                st.dataframe(terms, use_container_width=True, hide_index=True)
+
+        with forecast_tab:
+            st.subheader("📈 Hansard Volume Forecast")
+            st.info(
+                "This forecasts the future volume of Hansard records matching the "
+                "current query. It does not predict political outcomes, government "
+                "decisions, or individual MPs' future behaviour."
+            )
+            periods = st.slider(
+                "Forecast horizon (months)", min_value=3, max_value=24, value=6
+            )
+            forecast_data, forecast_error = forecast_hansard_volume(
+                prepared_hansard, periods=periods
+            )
+            if forecast_error:
+                st.warning(forecast_error)
+            elif not forecast_data.empty:
+                historical = forecast_data[forecast_data["type"] == "Historical"].copy()
+                projected = forecast_data[forecast_data["type"] == "Forecast"].copy()
+                st.markdown("### Historical Search Volume")
+                st.line_chart(historical, x="month", y="records")
+                st.markdown("### Forecast")
+                st.line_chart(
+                    projected.set_index("month")[["forecast", "lower_95", "upper_95"]]
+                )
+                display = projected[
+                    ["month", "forecast", "lower_95", "upper_95"]
+                ].copy()
+                display["month"] = display["month"].dt.strftime("%Y-%m")
+                for c in ["forecast", "lower_95", "upper_95"]:
+                    display[c] = display[c].round(1)
+                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Download Forecast CSV",
+                    data=display.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="hansard_volume_forecast.csv",
+                    mime="text/csv",
+                )
+    else:
+        st.info(
+            "Search the live Hansard database above to create a dataset for "
+            "analysis and forecasting."
+        )
+
+
+
+# ============================================================
+# 🏛️ TAB 3 — PARLIAMENTARY QUESTIONS
 # ============================================================
 
 with tab_pq:
@@ -2233,7 +2882,7 @@ with tab_pq:
 
 
 # ============================================================
-# 📚 TAB 3 — NRF DOCUMENTS
+# 📚 TAB 4 — NRF DOCUMENTS
 # ============================================================
 
 with tab_documents:
@@ -2621,7 +3270,7 @@ with tab_documents:
 
 
 # ============================================================
-# ⚙️ TAB 4 — REPOSITORY MANAGEMENT
+# ⚙️ TAB 5 — REPOSITORY MANAGEMENT
 # ============================================================
 
 with tab_admin:
