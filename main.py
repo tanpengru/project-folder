@@ -1544,85 +1544,159 @@ def _parse_hansard_html_results(html):
 
 
 def search_hansard_live(
-    query, start_date=None, end_date=None,
-    search_mode="Any of the words", title_only=False, max_results=100
+    query,
+    start_date=None,
+    end_date=None,
+    search_mode="Any of the words",
+    title_only=False,
+    max_results=100
 ):
+    """
+    Search the public Singapore Parliament Hansard search page.
+
+    This avoids the old /search/getDisplayData endpoint, which may no longer
+    return usable results. The function parses links to individual Hansard
+    topic/report pages from the public search response and returns a dataframe
+    suitable for the existing analytics and forecasting functions.
+    """
+
     query = str(query or "").strip()
     if not query:
         return pd.DataFrame(columns=HANSARD_COLUMNS), "Please enter a Hansard search query."
 
     option_map = {
-        "All the words": "all", "Any of the words": "any",
-        "Exact phrase": "exact", "Custom search": "custom",
+        "All the words": "all",
+        "Any of the words": "any",
+        "Exact phrase": "exact",
+        "Custom search": "custom",
     }
-    option = option_map.get(search_mode, "any")
-    start = start_date.strftime("%d/%m/%Y") if start_date else ""
-    end = end_date.strftime("%d/%m/%Y") if end_date else ""
 
-    payloads = [
-        {
-            "searchTerm": query, "keyword": query, "searchOption": option,
-            "titleOnly": title_only, "startDate": start, "endDate": end,
-            "page": 1, "pageSize": max_results,
-        },
-        {
-            "keyword": query, "searchOption": option, "searchTitle": title_only,
-            "fromDate": start, "toDate": end, "pageNo": 1,
-            "pageSize": max_results,
-        },
-    ]
+    params = {
+        "k": query,
+        "search": option_map.get(search_mode, "any"),
+    }
+
+    if title_only:
+        params["titleOnly"] = "true"
+    if start_date:
+        params["fromDate"] = start_date.strftime("%d/%m/%Y")
+    if end_date:
+        params["toDate"] = end_date.strftime("%d/%m/%Y")
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": HANSARD_SEARCH_URL,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": HANSARD_BASE_URL + "/",
     }
-    session = requests.Session()
-    errors = []
+
     try:
-        session.get(HANSARD_SEARCH_URL, headers=headers, timeout=HANSARD_TIMEOUT)
+        response = requests.get(
+            HANSARD_SEARCH_URL,
+            params=params,
+            headers=headers,
+            timeout=HANSARD_TIMEOUT,
+        )
+        response.raise_for_status()
     except Exception as exc:
-        logger.warning("Could not initialise Hansard session: %s", exc)
+        logger.exception("Hansard search request failed: %s", exc)
+        return pd.DataFrame(columns=HANSARD_COLUMNS), f"Hansard connection error: {exc}"
 
-    for payload in payloads:
-        for method in ("post", "get"):
-            try:
-                if method == "post":
-                    response = session.post(
-                        HANSARD_DISPLAY_ENDPOINT, json=payload,
-                        headers=headers, timeout=HANSARD_TIMEOUT
-                    )
-                else:
-                    response = session.get(
-                        HANSARD_DISPLAY_ENDPOINT, params=payload,
-                        headers=headers, timeout=HANSARD_TIMEOUT
-                    )
-                if not response.ok:
-                    continue
-                try:
-                    raw = _extract_records_from_json(response.json())
-                    records = [_normalise_hansard_record(r) for r in raw]
-                except Exception:
-                    records = _parse_hansard_html_results(response.text)
+    soup = BeautifulSoup(response.text, "html.parser")
+    records = []
+    seen = set()
 
-                records = [r for r in records if r.get("title") or r.get("content")]
-                if records:
-                    df = pd.DataFrame(records)
-                    for col in HANSARD_COLUMNS:
-                        if col not in df.columns:
-                            df[col] = ""
-                    df = (df[HANSARD_COLUMNS]
-                          .drop_duplicates(subset=["date", "title", "url"])
-                          .head(max_results).reset_index(drop=True))
-                    return df, ""
-            except Exception as exc:
-                errors.append(f"{method.upper()}: {exc}")
+    for link in soup.find_all("a", href=True):
+        href = str(link.get("href", "")).strip()
+        title = _clean_hansard_text(link.get_text(" ", strip=True))
+        href_lower = href.lower()
 
-    logger.warning("Hansard live search unsuccessful: %s", " | ".join(errors))
-    return pd.DataFrame(columns=HANSARD_COLUMNS), (
-        "The Singapore Parliament Hansard search endpoint did not return readable "
-        "results. The Parliament website may have changed its internal search format."
+        # Current/legacy SPRS topic links commonly contain sprs3topic.
+        # Keep a broader fallback for report/topic links so minor site changes
+        # do not immediately break the parser.
+        if not (
+            "sprs3topic" in href_lower
+            or "/topic" in href_lower
+            or "/report" in href_lower
+        ):
+            continue
+
+        if not title:
+            continue
+
+        url = urljoin(HANSARD_BASE_URL, href)
+        identity = (url, title)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        container = link.find_parent(["article", "section", "li", "tr", "div"]) or link.parent
+        container_text = _clean_hansard_text(
+            container.get_text(" ", strip=True) if container else title
+        )
+
+        date_value = ""
+        date_patterns = [
+            r"\b\d{1,2}\s+[A-Za-z]+\s+\d{4}\b",
+            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+            r"\b\d{4}-\d{2}-\d{2}\b",
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, container_text)
+            if match:
+                date_value = match.group(0)
+                break
+
+        speaker = ""
+        speaker_match = re.search(
+            r"\b(?:Mr|Ms|Mrs|Dr|Assoc Prof|Prof)\.?\s+[A-Z][A-Za-z .,'’\-]+",
+            container_text,
+        )
+        if speaker_match:
+            speaker = speaker_match.group(0).strip(" ,;:-")
+
+        records.append({
+            "date": date_value,
+            "parliament": "",
+            "title": title,
+            "speaker": speaker,
+            "content": container_text,
+            "url": url,
+            "source": "Singapore Parliament Hansard",
+        })
+
+        if len(records) >= max_results:
+            break
+
+    if not records:
+        logger.warning(
+            "No Hansard topic/report links found. Final URL: %s; status=%s",
+            response.url,
+            response.status_code,
+        )
+        return pd.DataFrame(columns=HANSARD_COLUMNS), (
+            "No readable Hansard results were returned for this search. "
+            "The official search page loaded, but its current result format "
+            "could not be parsed automatically. Use the official Hansard link "
+            "above to verify the query."
+        )
+
+    df = pd.DataFrame(records)
+    for col in HANSARD_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = (
+        df[HANSARD_COLUMNS]
+        .drop_duplicates(subset=["date", "title", "url"])
+        .head(max_results)
+        .reset_index(drop=True)
     )
 
+    return df, ""
 
 def prepare_hansard_dataframe(dataframe):
     if dataframe is None or dataframe.empty:
